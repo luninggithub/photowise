@@ -30,6 +30,10 @@ class OverlayView @JvmOverloads constructor(
     private var rollDeg = 0f
     private var allDone = false
     private var hasPerson = false
+    private var boxL = 0f
+    private var boxT = 0f
+    private var boxR = 0f
+    private var boxB = 0f
 
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(70, 255, 255, 255)
@@ -66,7 +70,11 @@ class OverlayView @JvmOverloads constructor(
         imgH: Int,
         rollDeg: Float,
         allDone: Boolean,
-        hasPerson: Boolean
+        hasPerson: Boolean,
+        boxL: Float,
+        boxT: Float,
+        boxR: Float,
+        boxB: Float
     ) {
         this.pose = pose
         this.imgW = imgW
@@ -74,6 +82,10 @@ class OverlayView @JvmOverloads constructor(
         this.rollDeg = rollDeg
         this.allDone = allDone
         this.hasPerson = hasPerson
+        this.boxL = boxL
+        this.boxT = boxT
+        this.boxR = boxR
+        this.boxB = boxB
         invalidate()
     }
 
@@ -108,14 +120,15 @@ class OverlayView @JvmOverloads constructor(
         canvas.drawLine(0f, h * 2f / 3f, w, h * 2f / 3f, gridPaint)
     }
 
-    /** 目标区间：人物高度应落在这条带子里（40%–70%） */
+    /** 当前拍法希望人物落进的框 */
     private fun drawTargetBand(canvas: Canvas) {
-        val top = sy(0.30f)
-        val bottom = sy(0.70f)
-        val left = sx(0.12f)
-        val right = sx(0.88f)
-        bandPaint.color = if (allDone) Color.argb(120, 76, 175, 80)
-        else Color.argb(80, 255, 255, 255)
+        if (boxR <= boxL || boxB <= boxT) return
+        val top = sy(boxT)
+        val bottom = sy(boxB)
+        val left = sx(boxL)
+        val right = sx(boxR)
+        bandPaint.color = if (allDone) Color.argb(140, 76, 175, 80)
+        else Color.argb(110, 255, 214, 79)
         val r = RectF(left, top, right, bottom)
         canvas.drawRoundRect(r, 10f, 10f, bandPaint)
     }

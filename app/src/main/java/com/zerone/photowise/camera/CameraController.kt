@@ -6,9 +6,12 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Rect
 import android.util.Size
+import android.view.Surface
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -37,6 +40,7 @@ class CameraController(
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private var camera: Camera? = null
     private var analysis: ImageAnalysis? = null
+    private var imageCapture: ImageCapture? = null
 
     private var srcBitmap: Bitmap? = null
     private var dstBitmap: Bitmap? = null
@@ -87,12 +91,27 @@ class CameraController(
 
         ia.setAnalyzer(executor) { proxy -> analyze(proxy) }
 
-        camera = provider.bindToLifecycle(
-            lifecycleOwner,
-            CameraSelector.DEFAULT_BACK_CAMERA,
-            preview,
-            ia
-        )
+        val capture = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .build()
+
+        camera = runCatching {
+            provider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                preview,
+                ia,
+                capture
+            )
+        }.getOrElse {
+            provider.bindToLifecycle(
+                lifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                preview,
+                ia
+            )
+        }
+        imageCapture = if (camera != null && provider.isBound(capture)) capture else null
         analysis = ia
 
         camera?.let { c ->
@@ -179,6 +198,36 @@ class CameraController(
         }
     }
 
+    fun canCapture(): Boolean = imageCapture != null
+
+    fun takePicture(onJpeg: (ByteArray) -> Unit, onError: (String) -> Unit) {
+        val capture = imageCapture
+        if (capture == null) {
+            onError("拍照还没准备好")
+            return
+        }
+        val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
+        capture.targetRotation = rotation
+        capture.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    val buffer = image.planes[0].buffer
+                    val bytes = ByteArray(buffer.remaining())
+                    buffer.get(bytes)
+                    onJpeg(bytes)
+                } catch (t: Throwable) {
+                    onError(t.message ?: "保存失败")
+                } finally {
+                    image.close()
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                onError(exception.message ?: "拍照失败")
+            }
+        })
+    }
+
     fun setExposureIndex(index: Int) {
         val c = camera ?: return
         val target = index.coerceIn(exposureMin, exposureMax)
@@ -190,6 +239,7 @@ class CameraController(
     fun stop() {
         analysis?.clearAnalyzer()
         analysis = null
+        imageCapture = null
         camera = null
     }
 }

@@ -18,16 +18,18 @@ import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.zerone.photowise.camera.CameraController
+import com.zerone.photowise.guidance.Audience
 import com.zerone.photowise.guidance.GuidanceEngine
 import com.zerone.photowise.guidance.GuidanceState
+import com.zerone.photowise.guidance.ShotPlan
 import com.zerone.photowise.imu.MotionMonitor
 import com.zerone.photowise.inference.Lm
 import com.zerone.photowise.inference.PersonSegmenter
 import com.zerone.photowise.inference.PoseEstimator
 import com.zerone.photowise.perf.PerfMonitor
+import com.zerone.photowise.session.SessionStore
 import com.zerone.photowise.ui.OverlayView
 import java.util.Locale
-import kotlin.math.roundToInt
 
 /**
  * POC 主界面：验证「实时构图指导」最小闭环 + 采集 M0 验收指标。
@@ -41,12 +43,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var hudView: TextView
     private lateinit var todoContainer: LinearLayout
     private lateinit var hintView: TextView
+    private lateinit var subjectView: TextView
     private lateinit var btnApply: Button
-    private lateinit var btnSeg: Button
     private lateinit var btnReset: Button
+    private lateinit var btnShutter: Button
+    private lateinit var btnPlanEnv: Button
+    private lateinit var btnPlanHalf: Button
+    private lateinit var btnPlanSil: Button
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val engine = GuidanceEngine()
+    private var session: SessionStore? = null
+    private var capturing = false
 
     private var cameraController: CameraController? = null
     private var poseEstimator: PoseEstimator? = null
@@ -65,7 +73,10 @@ class MainActivity : AppCompatActivity() {
     private var lastSegFg: Float? = null
 
     @Volatile
-    private var meanLuma: Float? = null
+    private var faceLuma: Float? = null
+
+    @Volatile
+    private var bgLuma: Float? = null
 
     private var lastPose: List<Lm>? = null
     private var lastState: GuidanceState? = null
@@ -88,22 +99,27 @@ class MainActivity : AppCompatActivity() {
         hudView = findViewById(R.id.hudView)
         todoContainer = findViewById(R.id.todoContainer)
         hintView = findViewById(R.id.hintView)
+        subjectView = findViewById(R.id.subjectView)
         btnApply = findViewById(R.id.btnApply)
-        btnSeg = findViewById(R.id.btnSeg)
         btnReset = findViewById(R.id.btnReset)
+        btnShutter = findViewById(R.id.btnShutter)
+        btnPlanEnv = findViewById(R.id.btnPlanEnv)
+        btnPlanHalf = findViewById(R.id.btnPlanHalf)
+        btnPlanSil = findViewById(R.id.btnPlanSil)
 
+        btnPlanEnv.setOnClickListener { selectPlan(ShotPlan.ENV) }
+        btnPlanHalf.setOnClickListener { selectPlan(ShotPlan.HALF) }
+        btnPlanSil.setOnClickListener { selectPlan(ShotPlan.SILHOUETTE) }
         btnApply.setOnClickListener { applySuggestion() }
-        btnSeg.setOnClickListener {
-            segEnabled = !segEnabled
-            btnSeg.text = if (segEnabled) "分割 开" else "分割 关"
-            if (!segEnabled) lastSegFg = null
-        }
+        btnShutter.setOnClickListener { capture() }
         btnReset.setOnClickListener {
             cameraController?.setZoom(1f)
             cameraController?.setExposureIndex(0)
             engine.reset()
+            session?.event("reset", lastState)
             toast("已复位变焦与曝光")
         }
+        stylePlanButtons()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
@@ -145,8 +161,12 @@ class MainActivity : AppCompatActivity() {
         }.onFailure {
             android.util.Log.e(TAG, "segmenter init failed", it)
             segEnabled = false
-            btnSeg.text = "分割 关"
         }.getOrNull()
+
+        session = runCatching { SessionStore(this) }.onFailure {
+            android.util.Log.e(TAG, "session init failed", it)
+        }.getOrNull()
+        session?.let { toast("记录在会话 ${it.sessionId}") }
 
         cameraController = CameraController(this, this, previewView, ::onFrame).also { it.start() }
 
@@ -178,23 +198,83 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (frameIndex % LUMA_INTERVAL == 0) {
-            sampleLuma(bitmap)
+            sampleLight(bitmap, lastPose)
         }
     }
 
-    private fun sampleLuma(src: Bitmap) {
+    private fun sampleLight(src: Bitmap, pose: List<Lm>?) {
         runCatching {
             lumaCanvas.drawBitmap(src, null, android.graphics.Rect(0, 0, lumaW, lumaH), null)
             lumaBitmap.getPixels(lumaPixels, 0, lumaW, 0, 0, lumaW, lumaH)
-            var sum = 0L
-            for (p in lumaPixels) {
-                val r = (p shr 16) and 0xFF
-                val g = (p shr 8) and 0xFF
-                val b = p and 0xFF
-                sum += (r * 299 + g * 587 + b * 114) / 1000
-            }
-            meanLuma = sum.toFloat() / lumaPixels.size
+            val face = boxOf(pose, intArrayOf(0, 2, 5, 7, 8), 0.04f)
+            faceLuma = regionLuma(face, inside = true)
+            val body = boxOf(pose, null, 0f)
+            bgLuma = if (body == null) average(0, lumaPixels.size) else regionLuma(body, inside = false)
         }
+    }
+
+    private fun boxOf(pose: List<Lm>?, indices: IntArray?, pad: Float): FloatArray? {
+        if (pose.isNullOrEmpty()) return null
+        var minX = 1f
+        var maxX = 0f
+        var minY = 1f
+        var maxY = 0f
+        var n = 0
+        val range = indices ?: IntArray(pose.size) { it }
+        for (i in range) {
+            val p = pose.getOrNull(i) ?: continue
+            if (p.visibility < 0.3f) continue
+            if (p.x < minX) minX = p.x
+            if (p.x > maxX) maxX = p.x
+            if (p.y < minY) minY = p.y
+            if (p.y > maxY) maxY = p.y
+            n++
+        }
+        if (n < 2) return null
+        return floatArrayOf(
+            (minX - pad).coerceIn(0f, 1f),
+            (minY - pad).coerceIn(0f, 1f),
+            (maxX + pad).coerceIn(0f, 1f),
+            (maxY + pad).coerceIn(0f, 1f)
+        )
+    }
+
+    /** box 为归一化 left,top,right,bottom。inside=false 时统计框外像素，当作背景。 */
+    private fun regionLuma(box: FloatArray?, inside: Boolean): Float? {
+        if (box == null) return null
+        val l = (box[0] * lumaW).toInt().coerceIn(0, lumaW - 1)
+        val t = (box[1] * lumaH).toInt().coerceIn(0, lumaH - 1)
+        val r = (box[2] * lumaW).toInt().coerceIn(l + 1, lumaW)
+        val b = (box[3] * lumaH).toInt().coerceIn(t + 1, lumaH)
+        var sum = 0L
+        var count = 0
+        var y = 0
+        while (y < lumaH) {
+            var x = 0
+            while (x < lumaW) {
+                val hit = x in l until r && y in t until b
+                if (hit == inside) {
+                    sum += lumaOf(lumaPixels[y * lumaW + x])
+                    count++
+                }
+                x += 2
+            }
+            y += 2
+        }
+        return if (count == 0) null else sum.toFloat() / count
+    }
+
+    private fun average(from: Int, until: Int): Float {
+        var sum = 0L
+        for (i in from until until) sum += lumaOf(lumaPixels[i])
+        return sum.toFloat() / (until - from).coerceAtLeast(1)
+    }
+
+    private fun lumaOf(p: Int): Int {
+        val r = (p shr 16) and 0xFF
+        val g = (p shr 8) and 0xFF
+        val b = p and 0xFF
+        return (r * 299 + g * 587 + b * 114) / 1000
     }
 
     private fun onPose(landmarks: List<Lm>?) {
@@ -215,7 +295,8 @@ class MainActivity : AppCompatActivity() {
             zoom = cam?.liveZoom() ?: 1f,
             zoomMax = cam?.zoomMax ?: 1f,
             segForeground = lastSegFg,
-            meanLuma = meanLuma
+            faceLuma = faceLuma,
+            bgLuma = bgLuma
         )
         lastState = state
         mainHandler.post { render(state) }
@@ -248,10 +329,17 @@ class MainActivity : AppCompatActivity() {
             imgH = cameraController?.frameHeight ?: 0,
             rollDeg = state.metrics.rollDeg,
             allDone = state.allDone,
-            hasPerson = state.hasPerson
+            hasPerson = state.hasPerson,
+            boxL = state.targetLeft,
+            boxT = state.targetTop,
+            boxR = state.targetRight,
+            boxB = state.targetBottom
         )
 
-        hintView.text = state.headline
+        val planName = state.plan?.title ?: "未选拍法"
+        hintView.text = "$planName · ${state.headline}"
+        subjectView.text = if (state.subjectLine.isBlank()) "被拍的人：选好拍法后，这里告诉他怎么站"
+        else "被拍的人：${state.subjectLine}"
 
         val ids = state.todos.map { it.id }
         if (ids != todoIds) {
@@ -277,8 +365,9 @@ class MainActivity : AppCompatActivity() {
         for (i in state.todos.indices) {
             val tv = todoContainer.getChildAt(i) as? TextView ?: continue
             val t = state.todos[i]
-            tv.text = (if (t.done) "✓ " else "● ") + t.text
-            tv.setTextColor(if (t.done) 0xFF7BE07B.toInt() else 0xFFFFE082.toInt())
+            val who = if (t.audience == Audience.SUBJECT) "他 " else "你 "
+            tv.text = (if (t.done) "✓ " else "● ") + who + t.text
+            tv.setTextColor(if (t.done) 0xFF7BE07B.toInt() else if (t.audience == Audience.SUBJECT) 0xFFB3E5FC.toInt() else 0xFFFFE082.toInt())
             tv.setBackgroundColor(if (t.done) 0x99002200.toInt() else 0x99000000.toInt())
         }
     }
@@ -301,7 +390,61 @@ class MainActivity : AppCompatActivity() {
         val z = zoom?.let { String.format(Locale.US, "变焦 x%.1f", it) } ?: ""
         val e = if (ev != null && ev != 0)
             String.format(Locale.US, "曝光 %+.1fEV", ev / 3f) else ""
-        toast(listOf(z, e).filter { it.isNotEmpty() }.joinToString(" / "))
+        val msg = listOf(z, e).filter { it.isNotEmpty() }.joinToString(" / ")
+        session?.event("apply", s, mapOf("zoom" to (zoom?.toString() ?: ""), "ev" to (ev?.toString() ?: "")))
+        toast(msg)
+    }
+
+    private fun selectPlan(plan: ShotPlan) {
+        engine.setPlan(plan)
+        stylePlanButtons()
+        session?.event("plan", lastState, mapOf("plan" to plan.name))
+        toast("拍法：${plan.title}")
+    }
+
+    private fun stylePlanButtons() {
+        val selected = 0xFF1B5E20.toInt()
+        val normal = 0xFF424242.toInt()
+        val current = engine.currentPlan()
+        btnPlanEnv.setBackgroundColor(if (current == ShotPlan.ENV) selected else normal)
+        btnPlanHalf.setBackgroundColor(if (current == ShotPlan.HALF) selected else normal)
+        btnPlanSil.setBackgroundColor(if (current == ShotPlan.SILHOUETTE) selected else normal)
+        btnPlanEnv.setTextColor(0xFFFFFFFF.toInt())
+        btnPlanHalf.setTextColor(0xFFFFFFFF.toInt())
+        btnPlanSil.setTextColor(0xFFFFFFFF.toInt())
+    }
+
+    private fun capture() {
+        val cam = cameraController ?: return
+        if (capturing) return
+        if (!cam.canCapture()) {
+            toast("这台手机暂时不能同时预览和拍照")
+            return
+        }
+        capturing = true
+        btnShutter.isEnabled = false
+        val state = lastState
+        cam.takePicture(
+            onJpeg = { bytes ->
+                session?.saveShot(bytes, state) { msg ->
+                    capturing = false
+                    btnShutter.isEnabled = true
+                    toast(msg)
+                } ?: runOnUiThread {
+                    capturing = false
+                    btnShutter.isEnabled = true
+                    toast("会话没建起来，照片未保存")
+                }
+            },
+            onError = { err ->
+                runOnUiThread {
+                    capturing = false
+                    btnShutter.isEnabled = true
+                    session?.event("shot_error", lastState, mapOf("error" to err))
+                    toast(err)
+                }
+            }
+        )
     }
 
     private fun startTicker() {
@@ -314,6 +457,7 @@ class MainActivity : AppCompatActivity() {
                 // POC 数据采集：每秒把指标打到 logcat，便于脚本化汇总
                 val head = lastState?.headline ?: "-"
                 val done = lastState?.allDone == true
+                session?.sample(lastState)
                 android.util.Log.i(TAG, "$hud | HEAD[$head] done=$done".replace('\n', ' '))
                 adaptToThermal()
                 mainHandler.postDelayed(this, 1000)
@@ -325,7 +469,7 @@ class MainActivity : AppCompatActivity() {
         val t = perf?.thermalStatus ?: 0
         if (t >= 3 && segEnabled) {
             segEnabled = false
-            btnSeg.text = "分割 关"
+            session?.event("thermal_off", lastState)
             toast("机身发热，已自动关闭分割以降低负载")
         }
     }
@@ -369,10 +513,11 @@ class MainActivity : AppCompatActivity() {
         sb.append(
             String.format(
                 Locale.US,
-                "分割前景 %s | 亮度 %s | 帧 %dx%d\n",
-                m?.segForeground?.let { String.format(Locale.US, "%.0f%%", it * 100f) } ?: "off",
-                m?.meanLuma?.let { String.format(Locale.US, "%.0f", it) } ?: "-",
-                cam?.frameWidth ?: 0, cam?.frameHeight ?: 0
+                "脸 %s | 背景 %s | %s | %s\n",
+                m?.faceLuma?.let { String.format(Locale.US, "%.0f", it) } ?: "-",
+                m?.bgLuma?.let { String.format(Locale.US, "%.0f", it) } ?: "-",
+                engine.currentPlan()?.title ?: "未选拍法",
+                session?.sessionId ?: "-"
             )
         )
         sb.append(
@@ -401,6 +546,7 @@ class MainActivity : AppCompatActivity() {
         runCatching { segmenter?.close() }
         runCatching { motion?.stop() }
         runCatching { perf?.stop() }
+        runCatching { session?.close() }
         super.onDestroy()
     }
 

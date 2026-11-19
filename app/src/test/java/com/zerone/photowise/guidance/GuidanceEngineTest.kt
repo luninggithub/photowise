@@ -9,9 +9,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
-/**
- * 引导规则单测：不依赖 Android，验证「一次只给一件事」与抖动抑制。
- */
 class GuidanceEngineTest {
 
     private lateinit var engine: GuidanceEngine
@@ -21,45 +18,52 @@ class GuidanceEngineTest {
         engine = GuidanceEngine()
     }
 
-    /**
-     * 造一个 33 点人体：head 在 top，脚踝在 bottom，其余点均匀铺在框内。
-     */
     private fun pose(
         top: Float,
         bottom: Float,
         left: Float = 0.4f,
         right: Float = 0.6f,
-        visibility: Float = 0.9f
+        visibility: Float = 0.9f,
+        profile: Boolean = false
     ): List<Lm> {
         val cx = (left + right) / 2f
         return (0 until 33).map { i ->
             val t = i / 32f
             val y = top + (bottom - top) * t
-            val x = if (i % 2 == 0) left else right
-            Lm(x = if (i == 0) cx else x, y = y, visibility = visibility)
+            val x = when {
+                profile -> cx + if (i % 2 == 0) -0.02f else 0.02f
+                i == 0 -> cx
+                i % 2 == 0 -> left
+                else -> right
+            }
+            Lm(x = x, y = y, visibility = visibility)
         }
     }
 
     private fun run(
         pose: List<Lm>?,
         roll: Float = 0f,
-        tilt: Float = 0f,
+        tilt: Float = 12f,
         zoom: Float = 1f,
+        face: Float? = 140f,
+        bg: Float? = 140f,
+        plan: ShotPlan? = ShotPlan.ENV,
         times: Int = 10
     ): GuidanceState {
+        engine.setPlan(plan)
         var state: GuidanceState? = null
         repeat(times) {
-            state = engine.update(
-                pose = pose,
-                rollDeg = roll,
-                tiltDeg = tilt,
-                zoom = zoom,
-                zoomMax = 8f,
-                segForeground = null,
-                meanLuma = 128f
-            )
+            state = engine.update(pose, roll, tilt, zoom, 8f, null, face, bg)
         }
         return state!!
+    }
+
+    @Test
+    fun `noPlan_doesNotSayReady`() {
+        val s = run(pose(0.12f, 0.46f, 0.60f, 0.74f, profile = true), plan = null, tilt = 12f)
+        assertFalse(s.allDone)
+        assertTrue(s.headline.contains("拍法"))
+        assertTrue(s.todos.isEmpty())
     }
 
     @Test
@@ -72,7 +76,6 @@ class GuidanceEngineTest {
 
     @Test
     fun `personTooSmall_suggestsMovingCloser`() {
-        // 人只占画面 10%
         val s = run(pose(top = 0.45f, bottom = 0.55f))
         val ratio = s.todos.first { it.id == "ratio" }
         assertFalse(ratio.done)
@@ -81,19 +84,31 @@ class GuidanceEngineTest {
 
     @Test
     fun `personCutOff_suppressesOtherAdvice`() {
-        // 脚出画：bottom > 1.0
         val s = run(pose(top = 0.10f, bottom = 1.05f))
         val cut = s.todos.first { it.id == "cut" }
         assertFalse(cut.done)
-        // 「一次只给一件事」：裁切没解决前，不给占比/留白建议
         assertNull(s.todos.firstOrNull { it.id == "ratio" })
         assertNull(s.todos.firstOrNull { it.id == "headroom" })
+        assertNull(s.todos.firstOrNull { it.id == "pose" })
+    }
+
+    @Test
+    fun `halfBody_allowsFeetOutOfFrame`() {
+        val s = run(pose(top = 0.08f, bottom = 1.05f, left = 0.35f, right = 0.65f), plan = ShotPlan.HALF, tilt = 0f)
+        assertTrue(s.todos.first { it.id == "cut" }.done)
+    }
+
+    @Test
+    fun `centeredPerson_isAskedToMoveAside`() {
+        val s = run(pose(top = 0.12f, bottom = 0.46f, left = 0.40f, right = 0.60f))
+        val pos = s.todos.first { it.id == "pos" }
+        assertFalse(pos.done)
+        assertTrue(pos.text.contains("往右"))
     }
 
     @Test
     fun `goodFraming_marksRatioAndHeadroomDone`() {
-        // 眼睛 0.06、脚踝 0.62 → 颅顶补偿后约 0.0225，占比约 60%
-        val s = run(pose(top = 0.06f, bottom = 0.62f))
+        val s = run(pose(top = 0.12f, bottom = 0.46f, left = 0.60f, right = 0.74f, profile = true))
         assertTrue(s.todos.first { it.id == "cut" }.done)
         assertTrue(s.todos.first { it.id == "ratio" }.done)
         assertTrue(s.todos.first { it.id == "headroom" }.done)
@@ -101,7 +116,7 @@ class GuidanceEngineTest {
 
     @Test
     fun `tiltedPhone_asksToLevel`() {
-        val s = run(pose(top = 0.05f, bottom = 0.60f), roll = 6f)
+        val s = run(pose(top = 0.12f, bottom = 0.46f, left = 0.60f, right = 0.74f, profile = true), roll = 6f)
         val level = s.todos.first { it.id == "level" }
         assertFalse(level.done)
         assertTrue(level.text.contains("端平"))
@@ -109,8 +124,7 @@ class GuidanceEngineTest {
 
     @Test
     fun `cameraTooHigh_asksToCrouch`() {
-        // tilt 明显为负 = 俯拍
-        val s = run(pose(top = 0.05f, bottom = 0.60f), tilt = -30f)
+        val s = run(pose(top = 0.12f, bottom = 0.46f), tilt = -30f)
         val height = s.todos.first { it.id == "height" }
         assertFalse(height.done)
         assertTrue(height.text.contains("蹲"))
@@ -118,53 +132,60 @@ class GuidanceEngineTest {
 
     @Test
     fun `stability_doesNotFlipOnSingleGoodFrame`() {
-        // 先给一帧不达标，再给一帧达标：不应立刻打勾
-        engine.update(pose(0.45f, 0.55f), 0f, 0f, 1f, 8f, null, 128f)
-        val s = engine.update(pose(0.05f, 0.60f), 0f, 0f, 1f, 8f, null, 128f)
-        val cut = s.todos.first { it.id == "cut" }
-        assertFalse("单帧达标不应立即判定完成（需连续 4 帧）", cut.done)
+        engine.setPlan(ShotPlan.ENV)
+        engine.update(pose(0.45f, 0.55f), 0f, 12f, 1f, 8f, null, 140f, 140f)
+        val s = engine.update(
+            pose(0.12f, 0.46f, 0.60f, 0.74f, profile = true),
+            0f, 12f, 1f, 8f, null, 140f, 140f
+        )
+        assertFalse(s.todos.first { it.id == "cut" }.done)
     }
 
     @Test
     fun `whenAllGood_headlineSaysReady`() {
-        val s = run(pose(top = 0.06f, bottom = 0.62f), roll = 0f, tilt = 0f)
+        val s = run(
+            pose(top = 0.12f, bottom = 0.46f, left = 0.60f, right = 0.74f, profile = true),
+            roll = 0f,
+            tilt = 12f
+        )
         assertTrue(s.allDone)
-        assertTrue(s.headline.contains("准备拍"))
+        assertTrue(s.headline.contains("可以拍了"))
+        assertEquals(Audience.SUBJECT, s.todos.first { it.id == "pose" }.audience)
     }
 
     @Test
     fun `suggestZoom_whenPersonSmall`() {
         val s = run(pose(top = 0.45f, bottom = 0.55f), zoom = 1f)
-        assertNotNull("人明显偏小时应建议拉近", s.suggestedZoom)
+        assertNotNull(s.suggestedZoom)
         assertTrue(s.suggestedZoom!! > 1f)
-        assertTrue("数码变焦上限 3x", s.suggestedZoom!! <= 3f)
+        assertTrue(s.suggestedZoom!! <= 2f)
     }
 
     @Test
     fun `suggestZoom_nullWhenFramingGood`() {
-        val s = run(pose(top = 0.05f, bottom = 0.60f), zoom = 1f)
+        val s = run(pose(top = 0.12f, bottom = 0.46f, left = 0.60f, right = 0.74f, profile = true), zoom = 1f)
         assertNull(s.suggestedZoom)
     }
 
     @Test
     fun `headTopCompensation_reducesHeadroom`() {
-        // 同一组关键点，脚踝可见时颅顶补偿生效，留白比「直接用眼睛位置」小
         val visible = run(pose(top = 0.20f, bottom = 0.80f))
-        val expectNoComp = 0.20f
-        assertTrue(
-            "颅顶补偿后留白应小于关键点最高点（${visible.metrics.headroom} < $expectNoComp）",
-            visible.metrics.headroom < expectNoComp
-        )
+        assertTrue(visible.metrics.headroom < 0.20f)
     }
 
     @Test
-    fun `exposureAdvice_fromLuma`() {
-        val dark = engine.update(pose(0.05f, 0.60f), 0f, 0f, 1f, 8f, null, 40f)
-        assertTrue("偏暗应建议加曝光", (dark.suggestedEvIndex ?: 0) > 0)
+    fun `exposureAdvice_fromFaceAndBackground`() {
+        engine.setPlan(ShotPlan.ENV)
+        val dark = engine.update(pose(0.12f, 0.46f), 0f, 12f, 1f, 8f, null, 40f, 50f)
+        assertTrue((dark.suggestedEvIndex ?: 0) > 0)
 
-        val bright = engine.update(pose(0.05f, 0.60f), 0f, 0f, 1f, 8f, null, 230f)
-        assertTrue("过亮应建议减曝光", (bright.suggestedEvIndex ?: 0) < 0)
+        val bright = engine.update(pose(0.12f, 0.46f), 0f, 12f, 1f, 8f, null, 210f, 200f)
+        assertTrue((bright.suggestedEvIndex ?: 0) < 0)
 
-        assertEquals(0, engine.update(pose(0.05f, 0.60f), 0f, 0f, 1f, 8f, null, 140f).suggestedEvIndex)
+        val ok = engine.update(pose(0.12f, 0.46f), 0f, 12f, 1f, 8f, null, 140f, 140f)
+        assertEquals(0, ok.suggestedEvIndex)
+
+        val back = engine.update(pose(0.12f, 0.46f), 0f, 12f, 1f, 8f, null, 70f, 180f)
+        assertTrue(back.todos.first { it.id == "exposure" }.text.contains("逆光"))
     }
 }
